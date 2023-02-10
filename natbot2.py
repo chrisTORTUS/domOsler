@@ -546,7 +546,7 @@ if (
 	__name__ == "__main__"
 ):
 	_crawler = Crawler()
-	openai.api_key = "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"
+	openai.api_key = os.environ.get("OPENAI_API_KEY")
 
 	def print_help():
 		print(
