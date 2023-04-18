@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-#
-# natbot.py
-#
-# Set OPENAI_API_KEY to your API key, and then run this from a terminal.
-#
-
 from playwright.sync_api import sync_playwright
 import time
 from sys import argv, exit, platform
@@ -12,8 +5,16 @@ import openai
 import os
 import json
 import requests
+import threading
+import pyautogui
+import pyperclip
+from google.cloud import speech
+import pyaudio
+from six.moves import queue
+import re
 
 quiet = False
+
 if len(argv) >= 2:
 	if argv[1] == '-q' or argv[1] == '--quiet':
 		quiet = True
@@ -22,10 +23,11 @@ if len(argv) >= 2:
 			+ "exercise caution when running suggested commands."
 		)
 
-system_instruction =instruction0 = """You are an agent controlling a browser. You are given:
+system_instruction = """You are an agent controlling a browser. You are given:
 
 	(1) an objective that you are trying to achieve
 	(2) a simplified text description of what's visible in the browser window (more on that below)
+	(3) a description of the previous screen and the action you took on it
 
 You can issue these commands:
 	SCROLL UP - scroll up one page
@@ -33,7 +35,7 @@ You can issue these commands:
 	CLICK X - click on a given element. You can only click on links, buttons, and inputs!
 	TYPE X "TEXT" - type the specified text into the input with id X
 	TYPESUBMIT X "TEXT" - same as TYPE above, except then it presses ENTER to submit the form
-	FINISHED - if you deem the objective to have been achieved, return the string 'finished'
+	DONE - if you think you have finished the task, simply say "DONE"
 
 The format of the browser content is highly simplified; all formatting elements are stripped.
 Interactive elements such as links, inputs, buttons are represented like this:
@@ -46,8 +48,18 @@ Images are rendered as their alt text like this:
 
 		<img id=4 alt=""/>
 
-Based on your given objective, issue whatever command you believe will get you closest to achieving your goal.
-Don't try to interact with elements that you can't see.
+Based on your given objective, current browser content, and description of previous action, think carefully about the next best action to take to get you closer to completing your objective.
+The hard rules you can't break are:
+	Don't interact with elements that you can't see
+	You have information about the preivous action you took on the previous screen. Never repeat the same action on the same screen
+If you think you have finished the task, simply say "DONE".
+You need to do two things, one before the other.
+First, write a short description of the contents of the screen you see and the action you want to take on the screen.
+Then, looking at the short description you wrote and the current browser content, suggest one of the above commands that best accomplishes your description of what you want to do.
+Your output will be in the format:
+1) DESCRIPTION OF SCREEN AND ACTION:
+2) SUGGESTED COMMAND:
+
 
 Here are some examples:
 
@@ -75,7 +87,11 @@ CURRENT BROWSER CONTENT:
 <text id=18>Settings</text>
 ------------------
 OBJECTIVE: Find a 2 bedroom house for sale in Anchorage AK for under $750k
-YOUR COMMAND: 
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION:  I am on the youtube home page, and I want to go to the google home page so that I can perform the search for the house
+
+DESCRIPTION OF SCREEN AND ACTION:
+I am on the google home page, and the action I want to take is to search for "anchorage redfin" in the google search bar
+SUGGESTED COMMAND:
 TYPESUBMIT 8 "anchorage redfin"
 ==================================================
 
@@ -103,7 +119,11 @@ CURRENT BROWSER CONTENT:
 <text id=18>Settings</text>
 ------------------
 OBJECTIVE: Make a reservation for 4 at Dorsia at 8pm
-YOUR COMMAND: 
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION: I am on the product list page for an amazon search for men's t shirts. I want to go to the google home page.
+
+DESCRIPTION OF SCREEN AND ACTION:
+This is the google home page, and I want to search for "dorsia nyc opentable" in the search bar
+SUGGESTED COMMAND:
 TYPESUBMIT 8 "dorsia nyc opentable"
 ==================================================
 
@@ -129,23 +149,100 @@ CURRENT BROWSER CONTENT:
 <button id=16>Next</button>
 ------------------
 OBJECTIVE: Make a reservation for 4 for dinner at Dorsia in New York City at 8pm
-YOUR COMMAND: 
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION: I am in google docs on a document titled "fundraising". I would like to go to the opentable website.
+
+DESCRIPTION OF SCREEN AND ACTION:
+I am on the opentable home page, and I would like to search for dorsia new york city
+SUGGESTED COMMAND:
 TYPESUBMIT 12 "dorsia new york city"
 ==================================================
 
-The current browser content and objective follow. Reply with your next command to the browser.
+The current browser content, objective, and previous action follow. Reply with your description of screen and action, and your suggested command.
+Before you reply, make sure you look closely at the description of the previous screen and action, and make sure you DO NOT repeat the same action on the same screen.
 """
 
 input_template = """
 CURRENT BROWSER CONTENT:
 ------------------
-$broswser_content
+$browser_content
 ------------------
 
 OBJECTIVE: $objective
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION: $previous_action
 """
 
-# black_listed_elements = set(["html", "head", "title", "meta", "iframe", "body", "script", "style", "path", "svg", "br", "::marker",])
+previous_action = ""
+
+
+RATE = 16000
+CHUNK = int(RATE / 10)  # 100ms
+
+class MicrophoneStream(object):
+	"""Opens a recording stream as a generator yielding the audio chunks."""
+
+	def __init__(self, rate, chunk):
+		self._rate = rate
+		self._chunk = chunk
+
+		# Create a thread-safe buffer of audio data
+		self._buff = queue.Queue()
+		self.closed = True
+
+	def __enter__(self):
+		self._audio_interface = pyaudio.PyAudio()
+		self._audio_stream = self._audio_interface.open(
+			format=pyaudio.paInt16,
+			# The API currently only supports 1-channel (mono) audio
+			# https://goo.gl/z757pE
+			channels=1,
+			rate=self._rate,
+			input=True,
+			frames_per_buffer=self._chunk,
+			# Run the audio stream asynchronously to fill the buffer object.
+			# This is necessary so that the input device's buffer doesn't
+			# overflow while the calling thread makes network requests, etc.
+			stream_callback=self._fill_buffer,
+		)
+
+		self.closed = False
+
+		return self
+
+	def __exit__(self, type, value, traceback):
+		self._audio_stream.stop_stream()
+		self._audio_stream.close()
+		self.closed = True
+		# Signal the generator to terminate so that the client's
+		# streaming_recognize method will not block the process termination.
+		self._buff.put(None)
+		self._audio_interface.terminate()
+
+	def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+		"""Continuously collect data from the audio stream, into the buffer."""
+		self._buff.put(in_data)
+		return None, pyaudio.paContinue
+
+	def generator(self):
+		while not self.closed:
+			# Use a blocking get() to ensure there's at least one chunk of
+			# data, and stop iteration if the chunk is None, indicating the
+			# end of the audio stream.
+			chunk = self._buff.get()
+			if chunk is None:
+				return
+			data = [chunk]
+
+			# Now consume whatever other data's still buffered.
+			while True:
+				try:
+					chunk = self._buff.get(block=False)
+					if chunk is None:
+						return
+					data.append(chunk)
+				except queue.Empty:
+					break
+
+			yield b"".join(data)
 
 class Crawler:
 	def __init__(self):
@@ -197,8 +294,16 @@ class Crawler:
 		else:
 			print("Could not find element")
 
+	#old type function without deleting existing text in the text field before typing
+	# def type(self, id, text):
+	# 	self.click(id)
+	# 	self.page.keyboard.type(text)
+
 	def type(self, id, text):
 		self.click(id)
+		self.page.keyboard.press('End')
+		self.page.keyboard.press('Shift+Home')
+		self.page.keyboard.press('Backspace')
 		self.page.keyboard.type(text)
 
 	def enter(self):
@@ -469,8 +574,8 @@ class Crawler:
 					"center_y": int(y + (height / 2)),
 				}
 			)
-		print("\n\n========elements in view_port=============\n\n")
-		print(elements_in_view_port)
+		# print("\n\n========elements in view_port=============\n\n")
+		# print(elements_in_view_port)
 
 		# lets filter further to remove anything that does not hold any text nor has click handlers + merge text from leaf#text nodes with the parent
 		elements_of_interest= []
@@ -534,69 +639,53 @@ class Crawler:
 
 		print("Parsing time: {:0.2f} seconds".format(time.time() - start))
 		return elements_of_interest
-
-if (
-	__name__ == "__main__"
-):
-	_crawler = Crawler()
-	openai.api_key = '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'
-	# openai.api_key = os.environ.get("OPENAI_API_KEY")
-
-	def print_help():
-		print(
-			"(g) to visit url\n(u) scroll up\n(d) scroll down\n(c) to click\n(t) to type\n" +
-			"(h) to view commands again\n(r/enter) to run suggested command\n(o) change objective"
-		)
-
-	# def get_gpt_command(objective, url, previous_command, browser_content):
-	# 	prompt = prompt_template
-	# 	prompt = prompt.replace("$objective", objective)
-	# 	prompt = prompt.replace("$url", url[:100])
-	# 	prompt = prompt.replace("$previous_command", previous_command)
-	# 	prompt = prompt.replace("$browser_content", browser_content[:4500])
-	# 	print("\n========= short content ===========\n")
-	# 	print(browser_content[:4500])
-	# 	print("\n========= all content ===========\n")
-	# 	print(browser_content)
-	# 	response = openai.Completion.create(model="text-davinci-002", prompt=prompt, temperature=0.5, best_of=10, n=3, max_tokens=50)
-	# 	return response.choices[0].text
 	
-	def get_gpt_command(objective, browser_content):
+
+class Actor(threading.Thread):
+	def __init__(self,stop_event) -> None:
+		threading.Thread.__init__(self)
+		self.crawler = Crawler()
+		self.stop_event = stop_event
+	
+	def get_gpt_response(self, objective, browser_content):
 		url = "https://api.openai.com/v1/chat/completions"
 		headers = {
 			"Content-Type": "application/json",
-			"Authorization": "Bearer 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"
+			"Authorization": "Bearer " + openai.api_key
 		}
 		user_message = input_template
-		user_message = user_message.replace("$broswser_content", browser_content)
+		user_message = user_message.replace("$browser_content", browser_content)
 		user_message = user_message.replace("$objective", objective)
+		user_message = user_message.replace("$previous_action", previous_action)
 
-		message = [{"role": "system", "content": instruction0}, {"role": "user", "content": user_message}]
+		conversation = [{"role": "system", "content": system_instruction}]
+		conversation.append({"role": "user", "content": user_message})
 
 		payload = {
 		"model": "gpt-4",
-		"messages": message,
+		"messages": conversation,
 		"temperature": 0,
-		"max_tokens": 50,
-		"stop": "\n"
+		"max_tokens": 100
+		# "stop": "\n"
 		}
 		response = requests.post(url, headers=headers, json=payload)
 		if response.status_code == 200:
-			return(response.json()["choices"][0]["message"]["content"])
+			suggested_command = response.json()["choices"][0]["message"]["content"]
+			return suggested_command
 		else:
 			print(f"Error: {response.status_code} - {response.text}")
 
-	def run_cmd(cmd):
+	def run_cmd(self, cmd):
 		cmd = cmd.split("\n")[0]
-
+		
 		if cmd.startswith("SCROLL UP"):
-			_crawler.scroll("up")
+			self.crawler.scroll("up")
 		elif cmd.startswith("SCROLL DOWN"):
-			_crawler.scroll("down")
+			self.crawler.scroll("down")
 		elif cmd.startswith("CLICK"):
 			commasplit = cmd.split(",")
 			id = commasplit[0].split(" ")[1]
-			_crawler.click(id)
+			self.crawler.click(id)
 		elif cmd.startswith("TYPE"):
 			spacesplit = cmd.split(" ")
 			id = spacesplit[1]
@@ -607,62 +696,140 @@ if (
 
 			if cmd.startswith("TYPESUBMIT"):
 				text += '\n'
-			_crawler.type(id, text)
+			self.crawler.type(id, text)
 
 		time.sleep(2)
 
-	# objective = "Make a reservation for 2 at 7pm at bistro vida in menlo park"
-	print("\nHi, I'm Osler! How can I help?")
-	i = input()
-	if len(i) > 0:
-		objective = i
+	def perform_command(self, objective):
 
-	gpt_cmd = ""
-	prev_cmd = ""
+		gpt_cmd = ""
+		prev_cmd = ""
 
-	try:
-		while True:
-			browser_content = "\n".join(_crawler.crawl())
-			prev_cmd = gpt_cmd
-			gpt_cmd = get_gpt_command(objective, browser_content)
-			gpt_cmd = gpt_cmd.strip()
+		try:
+			while not self.stop_event.is_set():
+				browser_content = "\n".join(self.crawler.crawl())
+				prev_cmd = gpt_cmd
+				gpt_response = self.get_gpt_response(objective, browser_content)
+				response_elems = gpt_response.split("\n")
+				print(response_elems)
+				action_description = response_elems[1]
+				previous_action = action_description
+				print("Previous action: " + previous_action)
+				# log.write("Previous action: " + previous_action + '\n')
+				gpt_cmd = response_elems[-1].strip()
+				# gpt_cmd = gpt_cmd.strip()
 
-			if not quiet:
-				print("URL: " + _crawler.page.url)
-				print("Objective: " + objective)
-				print("----------------\n" + browser_content + "\n----------------\n")
-			if len(gpt_cmd) > 0:
-				print("Suggested command: " + gpt_cmd)
+				if not quiet:
+					print("URL: " + self.crawler.page.url)
+					print("Objective: " + objective)
+					print("----------------\n" + browser_content + "\n----------------\n")
+					# log.write("----------------\n" + browser_content + "\n----------------\n")
+				if len(gpt_cmd) > 0:
+					print('Description of action: ' + gpt_response)
+					print("Suggested command: " + gpt_cmd)
+					# log.write('Description of action: ' + gpt_response + '\n')
+					# log.write("Suggested command: " + gpt_cmd + '\n')
 
-			command = input()
-			if command == "r" or command == "":
-				run_cmd(gpt_cmd)
-			elif command == "g":
-				url = input("URL:")
-				_crawler.go_to_page(url)
-			elif command == "u":
-				_crawler.scroll("up")
-				time.sleep(1)
-			elif command == "d":
-				_crawler.scroll("down")
-				time.sleep(1)
-			elif command == "c":
-				id = input("id:")
-				_crawler.click(id)
-				time.sleep(1)
-			elif command == "t":
-				id = input("id:")
-				text = input("text:")
-				_crawler.type(id, text)
-				time.sleep(1)
-			elif command == "o":
-				objective = input("Objective:")
-			#to execute a command different to that suggested by GPT
-			elif len(command) > 2:
-				print('running human command')
-				run_cmd(command)
+				self.run_cmd(gpt_cmd)
+
+		except KeyboardInterrupt:
+			print("\n[!] Ctrl+C detected, exiting gracefully.")
+			exit(0)
+
+	def listen_print_loop(self, responses):
+		"""Iterates through server responses and prints them.
+
+		The responses passed is a generator that will block until a response
+		is provided by the server.
+
+		Each response may contain multiple results, and each result may contain
+		multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
+		print only the transcription for the top alternative of the top result.
+
+		In this case, responses are provided for interim results as well. If the
+		response is an interim one, print a line feed at the end of it, to allow
+		the next result to overwrite it, until the response is a final one. For the
+		final one, print a newline to preserve the finalized transcription.
+		"""
+		num_chars_printed = 0
+		for response in responses:
+			if not response.results:
+				continue
+
+			# The `results` list is consecutive. For streaming, we only care about
+			# the first result being considered, since once it's `is_final`, it
+			# moves on to considering the next utterance.
+			result = response.results[0]
+			if not result.alternatives:
+				continue
+
+			# Display the transcription of the top alternative.
+			transcript = result.alternatives[0].transcript
+
+			# Display interim results, but with a carriage return at the end of the
+			# line, so subsequent lines will overwrite them.
+			#
+			# If the previous result was longer than this one, we need to print
+			# some extra spaces to overwrite the previous result
+			overwrite_chars = " " * (num_chars_printed - len(transcript))
+
+			if not result.is_final:
+				# sys.stdout.write(transcript + overwrite_chars + "\r")
+				# sys.stdout.flush()
+
+				# num_chars_printed = len(transcript)
+				pass
+
 			else:
-				print_help()
-	except KeyboardInterrupt:
-		print("\n[!] Ctrl+C detected, exiting gracefully.")
-		exit(0)
+				
+				# print(transcript + overwrite_chars)
+				output = transcript + overwrite_chars
+				# self.consultation_transcript += output
+				output = output.lower()
+
+				if "stop recording" in output:
+					break
+
+				print(output)
+				pyperclip.copy(transcript + overwrite_chars)
+				pyautogui.keyDown('command')
+				pyautogui.press('v')
+				pyautogui.keyUp('command')
+
+				# Exit recognition if any of the transcribed phrases could be
+				# one of our keywords.
+				if re.search(r"\b(exit|quit)\b", transcript, re.I):
+					print("Exiting..")
+					break
+
+				num_chars_printed = 0
+
+
+	def transcribe_consultation(self):
+		# See http://g.co/cloud/speech/docs/languagesv
+		# for a list of supported languages.
+		language_code = "en-US"  # a BCP-47 language tag
+
+		client = speech.SpeechClient()
+		config = speech.RecognitionConfig(
+			encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+			sample_rate_hertz=RATE,
+			language_code=language_code,
+			model='medical_conversation'
+		)
+
+		streaming_config = speech.StreamingRecognitionConfig(
+			config=config, interim_results=True
+		)
+
+		with MicrophoneStream(RATE, CHUNK) as stream:
+			audio_generator = stream.generator()
+			requests = (
+				speech.StreamingRecognizeRequest(audio_content=content)
+				for content in audio_generator
+			)
+
+			responses = client.streaming_recognize(streaming_config, requests)
+
+			# Now, put the transcription responses to use.
+			self.listen_print_loop(responses)

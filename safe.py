@@ -10,6 +10,8 @@ import time
 from sys import argv, exit, platform
 import openai
 import os
+import json
+import requests
 
 quiet = False
 if len(argv) >= 2:
@@ -20,12 +22,11 @@ if len(argv) >= 2:
 			+ "exercise caution when running suggested commands."
 		)
 
-prompt_template = """
-You are an agent controlling a browser. You are given:
+system_instruction = """You are an agent controlling a browser. You are given:
 
 	(1) an objective that you are trying to achieve
-	(2) the URL of your current web page
-	(3) a simplified text description of what's visible in the browser window (more on that below)
+	(2) a simplified text description of what's visible in the browser window (more on that below)
+	(3) a description of the previous screen and the action you took on it
 
 You can issue these commands:
 	SCROLL UP - scroll up one page
@@ -33,6 +34,7 @@ You can issue these commands:
 	CLICK X - click on a given element. You can only click on links, buttons, and inputs!
 	TYPE X "TEXT" - type the specified text into the input with id X
 	TYPESUBMIT X "TEXT" - same as TYPE above, except then it presses ENTER to submit the form
+	DONE - if you think you have finished the task, simply say "DONE"
 
 The format of the browser content is highly simplified; all formatting elements are stripped.
 Interactive elements such as links, inputs, buttons are represented like this:
@@ -45,18 +47,18 @@ Images are rendered as their alt text like this:
 
 		<img id=4 alt=""/>
 
-Based on your given objective, issue whatever command you believe will get you closest to achieving your goal.
-You always start on Google; you should submit a search query to Google that will take you to the best page for
-achieving your objective. And then interact with that page to achieve your objective.
+Based on your given objective, current browser content, and description of previous action, think carefully about the next best action to take to get you closer to completing your objective.
+The hard rules you can't break are:
+	Don't interact with elements that you can't see
+	You have information about the preivous action you took on the previous screen. Never repeat the same action on the same screen
+If you think you have finished the task, simply say "DONE".
+You need to do two things, one before the other.
+First, write a short description of the contents of the screen you see and the action you want to take on the screen.
+Then, looking at the short description you wrote and the current browser content, suggest one of the above commands that best accomplishes your description of what you want to do.
+Your output will be in the format:
+1) DESCRIPTION OF SCREEN AND ACTION:
+2) SUGGESTED COMMAND:
 
-If you find yourself on Google and there are no search results displayed yet, you should probably issue a command 
-like "TYPESUBMIT 7 "search query"" to get to a more useful page.
-
-Then, if you find yourself on a Google search results page, you might issue the command "CLICK 24" to click
-on the first link in the search results. (If your previous command was a TYPESUBMIT your next command should
-probably be a CLICK.)
-
-Don't try to interact with elements that you can't see.
 
 Here are some examples:
 
@@ -84,8 +86,11 @@ CURRENT BROWSER CONTENT:
 <text id=18>Settings</text>
 ------------------
 OBJECTIVE: Find a 2 bedroom house for sale in Anchorage AK for under $750k
-CURRENT URL: https://www.google.com/
-YOUR COMMAND: 
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION:  I am on the youtube home page, and I want to go to the google home page so that I can perform the search for the house
+
+DESCRIPTION OF SCREEN AND ACTION:
+I am on the google home page, and the action I want to take is to search for "anchorage redfin" in the google search bar
+SUGGESTED COMMAND:
 TYPESUBMIT 8 "anchorage redfin"
 ==================================================
 
@@ -113,8 +118,11 @@ CURRENT BROWSER CONTENT:
 <text id=18>Settings</text>
 ------------------
 OBJECTIVE: Make a reservation for 4 at Dorsia at 8pm
-CURRENT URL: https://www.google.com/
-YOUR COMMAND: 
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION: I am on the product list page for an amazon search for men's t shirts. I want to go to the google home page.
+
+DESCRIPTION OF SCREEN AND ACTION:
+This is the google home page, and I want to search for "dorsia nyc opentable" in the search bar
+SUGGESTED COMMAND:
 TYPESUBMIT 8 "dorsia nyc opentable"
 ==================================================
 
@@ -140,38 +148,47 @@ CURRENT BROWSER CONTENT:
 <button id=16>Next</button>
 ------------------
 OBJECTIVE: Make a reservation for 4 for dinner at Dorsia in New York City at 8pm
-CURRENT URL: https://www.opentable.com/
-YOUR COMMAND: 
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION: I am in google docs on a document titled "fundraising". I would like to go to the opentable website.
+
+DESCRIPTION OF SCREEN AND ACTION:
+I am on the opentable home page, and I would like to search for dorsia new york city
+SUGGESTED COMMAND:
 TYPESUBMIT 12 "dorsia new york city"
 ==================================================
 
-The current browser content, objective, and current URL follow. Reply with your next command to the browser.
+The current browser content, objective, and previous action follow. Reply with your description of screen and action, and your suggested command.
+Before you reply, make sure you look closely at the description of the previous screen and action, and make sure you DO NOT repeat the same action on the same screen.
+"""
 
+input_template = """
 CURRENT BROWSER CONTENT:
 ------------------
 $browser_content
 ------------------
 
 OBJECTIVE: $objective
-CURRENT URL: $url
-PREVIOUS COMMAND: $previous_command
-YOUR COMMAND:
+DESCRIPTION OF PREVIOUS SCREEN AND ACTION: $previous_action
 """
 
-black_listed_elements = set(["html", "head", "title", "meta", "iframe", "body", "script", "style", "path", "svg", "br", "::marker",])
+previous_action = ""
+
+# black_listed_elements = set(["html", "head", "title", "meta", "iframe", "body", "script", "style", "path", "svg", "br", "::marker",])
 
 class Crawler:
 	def __init__(self):
 		self.browser = (
 			sync_playwright()
 			.start()
-			.chromium.launch(
-				headless=False,
-			)
+			.chromium.connect_over_cdp("http://localhost:9222")
 		)
 
-		self.page = self.browser.new_page()
+		default_context = self.browser.contexts[0]
+		self.page = default_context.pages[0]
+
+		self.client = self.page.context.new_cdp_session(self.page)
 		self.page.set_viewport_size({"width": 1280, "height": 1080})
+		self.page_element_buffer = {}
+
 
 	def go_to_page(self, url):
 		self.page.goto(url=url if "://" in url else "http://" + url)
@@ -207,8 +224,16 @@ class Crawler:
 		else:
 			print("Could not find element")
 
+	#old type function without deleting existing text in the text field before typing
+	# def type(self, id, text):
+	# 	self.click(id)
+	# 	self.page.keyboard.type(text)
+
 	def type(self, id, text):
 		self.click(id)
+		self.page.keyboard.press('End')
+		self.page.keyboard.press('Shift+Home')
+		self.page.keyboard.press('Backspace')
 		self.page.keyboard.type(text)
 
 	def enter(self):
@@ -257,6 +282,9 @@ class Crawler:
 			"DOMSnapshot.captureSnapshot",
 			{"computedStyles": [], "includeDOMRects": True, "includePaintOrder": True},
 		)
+
+		with open("tree.json", "w") as outfile:
+			json.dump(tree, outfile)
 		strings	 	= tree["strings"]
 		document 	= tree["documents"][0]
 		nodes 		= document["nodes"]
@@ -352,6 +380,7 @@ class Crawler:
 			return value
 
 		for index, node_name_index in enumerate(node_names):
+
 			node_parent = parent[index]
 			node_name = strings[node_name_index].lower()
 
@@ -370,8 +399,8 @@ class Crawler:
 			except:
 				continue
 
-			if node_name in black_listed_elements:
-				continue
+			# if node_name in black_listed_elements:
+			# 	continue
 
 			[x, y, width, height] = bounds[cursor]
 			x /= device_pixel_ratio
@@ -475,6 +504,8 @@ class Crawler:
 					"center_y": int(y + (height / 2)),
 				}
 			)
+		# print("\n\n========elements in view_port=============\n\n")
+		# print(elements_in_view_port)
 
 		# lets filter further to remove anything that does not hold any text nor has click handlers + merge text from leaf#text nodes with the parent
 		elements_of_interest= []
@@ -551,14 +582,33 @@ if (
 			"(h) to view commands again\n(r/enter) to run suggested command\n(o) change objective"
 		)
 
-	def get_gpt_command(objective, url, previous_command, browser_content):
-		prompt = prompt_template
-		prompt = prompt.replace("$objective", objective)
-		prompt = prompt.replace("$url", url[:100])
-		prompt = prompt.replace("$previous_command", previous_command)
-		prompt = prompt.replace("$browser_content", browser_content[:4500])
-		response = openai.Completion.create(model="text-davinci-002", prompt=prompt, temperature=0.5, best_of=10, n=3, max_tokens=50)
-		return response.choices[0].text
+	def get_gpt_response(objective, browser_content):
+		url = "https://api.openai.com/v1/chat/completions"
+		headers = {
+			"Content-Type": "application/json",
+			"Authorization": "Bearer " + openai.api_key
+		}
+		user_message = input_template
+		user_message = user_message.replace("$browser_content", browser_content)
+		user_message = user_message.replace("$objective", objective)
+		user_message = user_message.replace("$previous_action", previous_action)
+
+		conversation = [{"role": "system", "content": system_instruction}]
+		conversation.append({"role": "user", "content": user_message})
+
+		payload = {
+		"model": "gpt-4",
+		"messages": conversation,
+		"temperature": 0,
+		"max_tokens": 100
+		# "stop": "\n"
+		}
+		response = requests.post(url, headers=headers, json=payload)
+		if response.status_code == 200:
+			suggested_command = response.json()["choices"][0]["message"]["content"]
+			return suggested_command
+		else:
+			print(f"Error: {response.status_code} - {response.text}")
 
 	def run_cmd(cmd):
 		cmd = cmd.split("\n")[0]
@@ -583,31 +633,36 @@ if (
 				text += '\n'
 			_crawler.type(id, text)
 
-		time.sleep(2)
+		time.sleep(3)
 
-	objective = "Make a reservation for 2 at 7pm at bistro vida in menlo park"
-	print("\nWelcome to natbot! What is your objective?")
+	# objective = "Make a reservation for 2 at 7pm at bistro vida in menlo park"
+	print("\nHi, I'm Osler! How can I help?")
 	i = input()
 	if len(i) > 0:
 		objective = i
 
 	gpt_cmd = ""
 	prev_cmd = ""
-	_crawler.go_to_page("google.com")
+
 	try:
 		while True:
 			browser_content = "\n".join(_crawler.crawl())
 			prev_cmd = gpt_cmd
-			gpt_cmd = get_gpt_command(objective, _crawler.page.url, prev_cmd, browser_content)
-			gpt_cmd = gpt_cmd.strip()
+			gpt_response = get_gpt_response(objective, browser_content)
+			response_elems = gpt_response.split("\n")
+			action_description = response_elems[1]
+			previous_action = action_description
+			print("Previous action: " + previous_action)
+			gpt_cmd = response_elems[-1].strip()
+			# gpt_cmd = gpt_cmd.strip()
 
 			if not quiet:
 				print("URL: " + _crawler.page.url)
 				print("Objective: " + objective)
 				print("----------------\n" + browser_content + "\n----------------\n")
 			if len(gpt_cmd) > 0:
+				print('Description of action: ' + gpt_response)
 				print("Suggested command: " + gpt_cmd)
-
 
 			command = input()
 			if command == "r" or command == "":
@@ -632,6 +687,10 @@ if (
 				time.sleep(1)
 			elif command == "o":
 				objective = input("Objective:")
+			#to execute a command different to that suggested by GPT
+			elif len(command) > 2:
+				print('running human command')
+				run_cmd(command)
 			else:
 				print_help()
 	except KeyboardInterrupt:
