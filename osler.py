@@ -25,6 +25,9 @@ import threading
 
 from six.moves import queue
 from actor import Actor
+from dotenv import load_dotenv
+
+load_dotenv()
 
 log = open("logs.txt", "a")
 
@@ -95,6 +98,7 @@ class PicovoiceThread(Thread):
 			self.osler_thinking()
 			if 'begin' in command and 'consultation' in command:
 				actor.transcribe_consultation()
+				actor.summarise_transcription()
 			else:
 				actor.perform_command(command)
 
@@ -170,73 +174,7 @@ class PicovoiceThread(Thread):
 		self._stop = True
 
 	def is_stopped(self):
-		return self._is_stopped
-	
-	def listen_print_loop(self, responses):
-		"""Iterates through server responses and prints them.
-
-		The responses passed is a generator that will block until a response
-		is provided by the server.
-
-		Each response may contain multiple results, and each result may contain
-		multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
-		print only the transcription for the top alternative of the top result.
-
-		In this case, responses are provided for interim results as well. If the
-		response is an interim one, print a line feed at the end of it, to allow
-		the next result to overwrite it, until the response is a final one. For the
-		final one, print a newline to preserve the finalized transcription.
-		"""
-		num_chars_printed = 0
-		for response in responses:
-			if not response.results:
-				continue
-
-			# The `results` list is consecutive. For streaming, we only care about
-			# the first result being considered, since once it's `is_final`, it
-			# moves on to considering the next utterance.
-			result = response.results[0]
-			if not result.alternatives:
-				continue
-
-			# Display the transcription of the top alternative.
-			transcript = result.alternatives[0].transcript
-
-			# Display interim results, but with a carriage return at the end of the
-			# line, so subsequent lines will overwrite them.
-			#
-			# If the previous result was longer than this one, we need to print
-			# some extra spaces to overwrite the previous result
-			overwrite_chars = " " * (num_chars_printed - len(transcript))
-
-			if not result.is_final:
-				# sys.stdout.write(transcript + overwrite_chars + "\r")
-				# sys.stdout.flush()
-
-				# num_chars_printed = len(transcript)
-				pass
-
-			else:
-				
-				# print(transcript + overwrite_chars)
-				output = transcript + overwrite_chars
-				# self.consultation_transcript += output
-				output = output.lower()
-
-				if "stop" in output:
-					print(output)
-					break
-			
-				print(transcript + overwrite_chars)
-
-				# Exit recognition if any of the transcribed phrases could be
-				# one of our keywords.
-				if re.search(r"\b(exit|quit)\b", transcript, re.I):
-					print("Exiting..")
-					break
-		
-				num_chars_printed = 0
-		
+		return self._is_stopped	
 		
 	def receive_speech_command(self):
 		with sr.Microphone() as source:
@@ -268,13 +206,17 @@ class PicovoiceThread(Thread):
 
 
 def main():
+	#set environment variables
+	openai.api_key= os.getenv('OPENAI_API_KEY')
+	PV_KEY = os.getenv("PV_KEY")
+
 	def stop_thread():
 		global stop_event
 		stop_event.set()
-	global stop_event 
+
+	global stop_event
+	
 	stop_event= threading.Event()
-	openai.api_key = os.environ.get("OPENAI_API_KEY")
-	ACCESS_KEY = os.environ.get("PV_KEY")
 	window = tk.Tk()
 	window.title("OSLER Demo")
 	width, height = 350, 350
@@ -289,7 +231,7 @@ def main():
 	stop_button = tk.Button(window, text="Stop", command=stop_thread)
 	stop_button.pack(side=tk.BOTTOM, pady=10)
 
-	picovoice_thread = PicovoiceThread(label, ACCESS_KEY)
+	picovoice_thread = PicovoiceThread(label, PV_KEY)
 
 	def on_close():
 		picovoice_thread.stop()
